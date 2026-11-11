@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 # 示例数据（行列序号均从 0 开始，与请求中的矩阵下标一致）---------------
 
@@ -48,6 +56,114 @@ EX_HALL_CONFLICT: dict = {
     ],
     "row_totals": [10, 7],
     "col_totals": [5, 12],
+}
+
+# ---------------------------------------------------------------------------
+# 阳性检验记录更正核算示例
+# ---------------------------------------------------------------------------
+
+# 示例 5：跨月撤销。P0001 首条记录采样于 1 月 31 日，其 14 天窗口覆盖到
+# 2 月 13 日，2 月 10 日的记录被覆盖不计；撤销首条后，2 月 10 日的记录
+# 自立窗口，病例从 1 月月报单元移到 2 月（1 月扣减 1、2 月补计 1）。
+EX_CROSS_MONTH_REVOKE: dict = {
+    "records": [
+        {
+            "record_id": "JC2026013101",
+            "person_id": "P0001",
+            "sample_date": "2026-01-31",
+            "township": "城东街道",
+            "age_group": "18-59岁",
+        },
+        {
+            "record_id": "JC2026021002",
+            "person_id": "P0001",
+            "sample_date": "2026-02-10",
+            "township": "城东街道",
+            "age_group": "18-59岁",
+        },
+        {
+            "record_id": "JC2026011503",
+            "person_id": "P0002",
+            "sample_date": "2026-01-15",
+            "township": "河西镇",
+            "age_group": "60岁及以上",
+        },
+    ],
+    "corrections": {
+        "add": [],
+        "replace": [],
+        "revoke": ["JC2026013101"],
+    },
+}
+
+# 示例 6：新增 + 整条替换。替换把 3 月 20 日的记录改回 3 月 10 日，
+# 落入 3 月 1 日开窗的 14 天窗口内而不再单独计例；同时为 P1002 新增
+# 一条 3 月 5 日的记录。
+EX_ADD_REPLACE: dict = {
+    "records": [
+        {
+            "record_id": "JC2026030110",
+            "person_id": "P1001",
+            "sample_date": "2026-03-01",
+            "township": "河口镇",
+            "age_group": "0-17岁",
+        },
+        {
+            "record_id": "JC2026032011",
+            "person_id": "P1001",
+            "sample_date": "2026-03-20",
+            "township": "河口镇",
+            "age_group": "0-17岁",
+        },
+    ],
+    "corrections": {
+        "add": [
+            {
+                "record_id": "JC2026030501",
+                "person_id": "P1002",
+                "sample_date": "2026-03-05",
+                "township": "河口镇",
+                "age_group": "18-59岁",
+            }
+        ],
+        "replace": [
+            {
+                "record_id": "JC2026032011",
+                "person_id": "P1001",
+                "sample_date": "2026-03-10",
+                "township": "河口镇",
+                "age_group": "0-17岁",
+            }
+        ],
+        "revoke": [],
+    },
+}
+
+# 示例 7：整批报错。新增的编号已存在，且要撤销的编号找不到，
+# 整批拒绝并一次性返回全部原因（HTTP 409）。
+EX_BATCH_CONFLICT: dict = {
+    "records": [
+        {
+            "record_id": "JC2026040101",
+            "person_id": "P2001",
+            "sample_date": "2026-04-01",
+            "township": "城北街道",
+            "age_group": "18-59岁",
+        }
+    ],
+    "corrections": {
+        "add": [
+            {
+                "record_id": "JC2026040101",
+                "person_id": "P2002",
+                "sample_date": "2026-04-03",
+                "township": "城北街道",
+                "age_group": "0-17岁",
+            }
+        ],
+        "replace": [],
+        "revoke": ["JC2026049999"],
+    },
 }
 
 
@@ -187,3 +303,121 @@ class ConflictResponse(BaseModel):
 class HealthResponse(BaseModel):
     status: Literal["ok"]
     service: str
+
+
+# ---------------------------------------------------------------------------
+# 阳性检验记录更正核算
+# ---------------------------------------------------------------------------
+
+# 防御性上限：单次提交的原始记录与各更正操作数量
+MAX_RECORDS = 10000
+
+
+class PositiveRecord(BaseModel):
+    """一条阳性检验记录。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    record_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="检验记录号（全局唯一，同日记录按其字典序升序排列）",
+        examples=["JC2026013101"],
+    )
+    person_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="脱敏人员编号（窗口按人独立计算）",
+        examples=["P0001"],
+    )
+    sample_date: date = Field(
+        ...,
+        description="采样日（YYYY-MM-DD）；开窗时该日为 14 天窗口的第 1 天",
+        examples=["2026-01-31"],
+    )
+    township: str = Field(
+        ..., min_length=1, max_length=64, description="乡镇（街道）", examples=["城东街道"]
+    )
+    age_group: str = Field(
+        ..., min_length=1, max_length=32, description="年龄组", examples=["18-59岁"]
+    )
+
+
+class CorrectionBatch(BaseModel):
+    """更正批次：按检验记录号新增、整条替换或撤销。
+
+    三类操作共享同一编号空间，批次内编号不得重复；任一校验失败
+    （重复编号、新增编号已存在、替换/撤销目标不存在）即整批拒绝，
+    不应用任何更正。
+    """
+
+    add: list[PositiveRecord] = Field(
+        default_factory=list,
+        max_length=MAX_RECORDS,
+        description="新增的完整记录；检验记录号不得与现有记录重复",
+    )
+    replace: list[PositiveRecord] = Field(
+        default_factory=list,
+        max_length=MAX_RECORDS,
+        description="整条替换：按检验记录号定位原记录，其余字段（人员、采样日、乡镇、年龄组）整体替换",
+    )
+    revoke: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_RECORDS,
+        description="要撤销的检验记录号",
+    )
+
+
+class CorrectionImpactRequest(BaseModel):
+    """更正影响核算请求：更正前全部阳性记录 + 一个更正批次。"""
+
+    records: list[PositiveRecord] = Field(
+        ...,
+        max_length=MAX_RECORDS,
+        description="受影响人员更正前的全部阳性检验记录",
+    )
+    corrections: CorrectionBatch = Field(..., description="更正批次（新增 / 整条替换 / 撤销）")
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {"summary": "跨月撤销：病例从 1 月移到 2 月", "value": EX_CROSS_MONTH_REVOKE},
+                {"summary": "新增 + 整条替换", "value": EX_ADD_REPLACE},
+                {"summary": "整批报错：新增编号已存在且撤销目标不存在", "value": EX_BATCH_CONFLICT},
+            ]
+        }
+    }
+
+
+class CaseCountDelta(BaseModel):
+    """一个月报单元（采样月 × 乡镇 × 年龄组）的病例数差额。"""
+
+    month: str = Field(..., description="窗口首条记录的采样月，YYYY-MM", examples=["2026-02"])
+    township: str = Field(..., description="乡镇（街道）", examples=["城东街道"])
+    age_group: str = Field(..., description="年龄组", examples=["18-59岁"])
+    delta: int = Field(
+        ...,
+        description="更正后 − 更正前；正数需补计，负数需扣减，恒为非零整数",
+        examples=[1],
+    )
+
+
+class CorrectionImpactResponse(BaseModel):
+    status: Literal["ok"]
+    window_days: int = Field(..., description="窗口长度（天），采样日为第 1 天")
+    delta_units: int = Field(..., description="发生变化的月报单元数量")
+    deltas: list[CaseCountDelta] = Field(
+        ...,
+        description="仅含非零差额的月报单元，按（采样月, 乡镇, 年龄组）升序",
+    )
+
+
+class CorrectionConflictResponse(BaseModel):
+    """更正批次校验失败（HTTP 409）：整批拒绝，不应用任何更正。"""
+
+    status: Literal["conflict"]
+    reasons: list[str] = Field(
+        ..., description="整批拒绝的全部原因（重复编号 / 新增已存在 / 目标不存在）"
+    )

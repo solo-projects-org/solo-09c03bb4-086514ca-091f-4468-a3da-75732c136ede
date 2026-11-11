@@ -1,4 +1,4 @@
-"""FastAPI 应用：遮盖值反推核查服务。"""
+"""FastAPI 应用：遮盖值反推核查 + 阳性记录更正差额核算服务。"""
 
 from __future__ import annotations
 
@@ -7,26 +7,35 @@ from typing import Annotated
 from fastapi import Body, FastAPI
 from fastapi.responses import JSONResponse
 
-from . import solver
+from . import correction, solver
 from .schemas import (
-    ConflictResponse,
+    EX_ADD_REPLACE,
+    EX_BATCH_CONFLICT,
+    EX_CROSS_MONTH_REVOKE,
     EX_HALL_CONFLICT,
     EX_RANGE,
     EX_RECOVERABLE,
     EX_TOTAL_CONFLICT,
+    ConflictResponse,
+    CorrectionConflictResponse,
+    CorrectionImpactRequest,
+    CorrectionImpactResponse,
     FeasibleResponse,
     HealthResponse,
     SuppressionRequest,
 )
 
 app = FastAPI(
-    title="医院计数矩阵遮盖核查 API",
+    title="医院月报数据核查 API",
     description=(
-        "发布分年龄组、乡镇的病例计数前，检查 null 遮盖格能否被公开的"
-        "行/列合计精确反推。对每个隐藏格返回可行最小值、最大值及分别"
-        "达到两界的完整可行矩阵；两界相同标记为可还原；无解时返回冲突。"
+        "面向医院数仓工程师的两个核查接口：\n\n"
+        "1. **遮盖核查**：发布分年龄组、乡镇的病例计数前，检查 null 遮盖格"
+        "能否被公开的行/列合计精确反推；\n"
+        "2. **更正核算**：阳性检验记录入仓后发生更正（新增 / 整条替换 / "
+        "撤销）时，按 14 天窗口规则重算病例数，返回各「采样月 × 乡镇 × "
+        "年龄组」月报单元需要补计或扣减的非零差额。"
     ),
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -100,3 +109,63 @@ def suppression_check(
 )
 def method() -> dict:
     return solver.fraction_explanation()
+
+
+def _to_case_records(records) -> list[correction.CaseRecord]:
+    return [correction.CaseRecord(**rec.model_dump()) for rec in records]
+
+
+@app.post(
+    "/api/v1/case-count-correction",
+    response_model=CorrectionImpactResponse,
+    responses={
+        409: {
+            "model": CorrectionConflictResponse,
+            "description": "更正批次校验失败，整批拒绝",
+        }
+    },
+    tags=["更正核算"],
+    summary="提交更正前阳性记录与更正批次，返回月报单元补计/扣减差额",
+)
+def case_count_correction(
+    payload: Annotated[
+        CorrectionImpactRequest,
+        Body(
+            openapi_examples={
+                "cross_month_revoke": {
+                    "summary": "跨月撤销：病例从 1 月移到 2 月",
+                    "description": (
+                        "撤销 1 月 31 日的首诊记录后，2 月 10 日的记录自立"
+                        " 14 天窗口：1 月单元扣减 1，2 月单元补计 1"
+                    ),
+                    "value": EX_CROSS_MONTH_REVOKE,
+                },
+                "add_and_replace": {
+                    "summary": "新增 + 整条替换",
+                    "description": (
+                        "替换把 3 月 20 日的记录改回 3 月 10 日，落入既有"
+                        "窗口不再单独计例；同时为另一人新增一条记录"
+                    ),
+                    "value": EX_ADD_REPLACE,
+                },
+                "batch_conflict": {
+                    "summary": "整批报错：新增编号已存在且撤销目标不存在",
+                    "description": "任一校验失败即整批拒绝（HTTP 409），一次性返回全部原因",
+                    "value": EX_BATCH_CONFLICT,
+                },
+            }
+        ),
+    ]
+):
+    try:
+        return correction.compute_impact(
+            records=_to_case_records(payload.records),
+            adds=_to_case_records(payload.corrections.add),
+            replaces=_to_case_records(payload.corrections.replace),
+            revokes=list(payload.corrections.revoke),
+        )
+    except correction.CorrectionConflict as exc:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "conflict", "reasons": exc.reasons},
+        )
